@@ -1,6 +1,16 @@
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { config } from "./config.js";
+import postgres from "postgres";
+import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { drizzle } from "drizzle-orm/postgres-js";
+import { createUser, deleteAllUsers } from "./db/queries/users.js";
+import { db } from "./db/index.js";
+import {
+  createChirp,
+  getAllChirps,
+  getChirpById,
+} from "./db/queries/chirps.js";
 
 const app = express();
 
@@ -52,6 +62,9 @@ const middlewareLogResponses = (
   next();
 };
 
+process.loadEnvFile();
+const migrationClient = postgres(config.db.url, { max: 1 });
+await migrate(drizzle(migrationClient), config.db.migrationConfig);
 function middlewareMetricsInc(_: Request, __: Response, next: NextFunction) {
   config.fileserverHits++;
   next();
@@ -79,22 +92,38 @@ app.get("/admin/metrics", (_: Request, res: Response) => {
   `);
 });
 
-app.post("/admin/reset", (_: Request, res: Response) => {
+app.post("/admin/reset", async (_: Request, res: Response) => {
+  if (config.PLATFORM !== "dev") {
+    res.status(403).send("Forbidden");
+    return;
+  }
+
+  await deleteAllUsers();
+
   config.fileserverHits = 0;
+
   res.set("Content-Type", "text/plain; charset=utf-8");
-  res.send("OK");
+  res.status(200).send("OK");
 });
 
-app.post("/api/validate_chirp", async (req: Request, res: Response) => {
-  const parsedBody = req.body;
+app.post("/api/chirps", async (req: Request, res: Response) => {
+  const { body, userId } = req.body;
 
-  if (parsedBody.body.length > 140) {
+  if (!body || typeof body !== "string") {
+    throw new BadRequestError("Chirp body is required");
+  }
+
+  if (!userId || typeof userId !== "string") {
+    throw new BadRequestError("User ID is required");
+  }
+
+  if (body.length > 140) {
     throw new BadRequestError("Chirp is too long. Max length is 140");
   }
 
   const profaneWords = ["kerfuffle", "sharbert", "fornax"];
 
-  const cleanedBody = parsedBody.body
+  const cleanedBody = body
     .split(" ")
     .map((word: string) => {
       if (profaneWords.includes(word.toLowerCase())) {
@@ -105,9 +134,40 @@ app.post("/api/validate_chirp", async (req: Request, res: Response) => {
     })
     .join(" ");
 
-  res.status(200).json({
-    cleanedBody,
+  const chirp = await createChirp({
+    body: cleanedBody,
+    userId,
   });
+
+  res.status(201).json(chirp);
+});
+
+app.post("/api/users", async (req: Request, res: Response) => {
+  const { email } = req.body;
+  const user = await createUser({
+    email,
+  });
+
+  res.status(201).json(user);
+});
+app.get("/api/chirps", async (_req: Request, res: Response) => {
+  const chirps = await getAllChirps();
+
+  res.status(200).json(chirps);
+});
+app.get("/api/chirps/:chirpId", async (req: Request, res: Response) => {
+  const { chirpId } = req.params;
+
+  const chirp = await getChirpById(chirpId as string);
+
+  if (!chirp) {
+    res.status(404).json({
+      error: "Chirp not found",
+    });
+    return;
+  }
+
+  res.status(200).json(chirp);
 });
 
 function errorHandler(err: Error, _: Request, res: Response, __: NextFunction) {
